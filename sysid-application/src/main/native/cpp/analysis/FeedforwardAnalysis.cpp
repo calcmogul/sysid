@@ -6,6 +6,9 @@
 
 #include <cmath>
 
+#include <Eigen/Cholesky>
+#include <Eigen/Core>
+#include <fmt/core.h>
 #include <units/math.h>
 #include <units/time.h>
 
@@ -80,6 +83,115 @@ static void PopulateNextVelOLSVector(const std::vector<PreparedData>& d,
   }
 }
 
+static std::tuple<std::vector<double>, double> RefineGains(
+    const std::vector<double>& data, units::second_t dtMean,
+    size_t independentVariables, const std::vector<double>& initialGains) {
+  fmt::print(stderr, "RefineGains() initial guess\n");
+  fmt::print(stderr, "  {}, {}, {}\n", initialGains[0], initialGains[1],
+             initialGains[2]);
+
+  // Perform some quick sanity checks regarding the size of the vector.
+  assert(data.size() % (independentVariables + 1) == 0);
+
+  // Get the number of elements.
+  size_t n = data.size() / (independentVariables + 1);
+
+  // Create new variables to make things more readable.
+  size_t rows = n;
+  size_t cols = independentVariables;  // X
+  size_t strd = independentVariables + 1;
+
+  // Create y and X matrices.
+  Eigen::Map<const Eigen::MatrixXd, 0, Eigen::Stride<1, Eigen::Dynamic>> y(
+      data.data() + 0, rows, 1, Eigen::Stride<1, Eigen::Dynamic>(1, strd));
+
+  Eigen::Map<const Eigen::MatrixXd, 0, Eigen::Stride<1, Eigen::Dynamic>> X(
+      data.data() + 1, rows, cols, Eigen::Stride<1, Eigen::Dynamic>(1, strd));
+
+  // Implement the Gauss-Newton algorithm for nonlinear least squares
+  Eigen::Matrix<double, 3, 1> beta;
+  // beta << initialGains[0], initialGains[1] - 0.03e-2, initialGains[2]
+  // + 9.9e-3;
+  beta << initialGains[0], initialGains[1], initialGains[2];
+  Eigen::Matrix<double, 3, 1> nextBeta;
+
+  auto f = [=](double x, double u, double T,
+               const Eigen::Matrix<double, 3, 1>& beta) {
+    const double& Ks = beta(0);
+    const double& Kv = beta(1);
+    const double& Ka = beta(2);
+
+    double alpha = std::exp(-Kv / Ka * T);
+    return alpha * x + 1.0 / Kv * (1.0 - alpha) * u +
+           Ks / Kv * (alpha - 1.0) * wpi::sgn(x);
+  };
+
+  double T = dtMean.to<double>();
+
+  Eigen::MatrixXd J{rows, independentVariables};
+  bool repeat = true;
+  while (repeat) {
+    for (int i = 0; i < rows; ++i) {
+      const double& x = X(i, 0);
+      const double& u = X(i, 1);
+
+      const double& Ks = beta(0);
+      const double& Kv = beta(1);
+      const double& Ka = beta(2);
+
+      double a = std::exp(-Kv / Ka * T);
+      double b = Ks * wpi::sgn(x) - u + Kv * x;
+      J(i, 0) = 1.0 / Kv * (a - 1.0) * wpi::sgn(x);
+      J(i, 1) = a *
+                (Ka * (Ks * wpi::sgn(x) - u) * (std::exp(Kv / Ka * T) - 1.0) -
+                 T * Kv * b) /
+                (Ka * Kv * Kv);
+      J(i, 2) = T * a * b / (Ka * Ka);
+    }
+
+    Eigen::MatrixXd b = (J.transpose() * J).llt().solve(J.transpose());
+
+    Eigen::MatrixXd r{rows, 1};
+    for (int i = 0; i < rows; ++i) {
+      r(i) = y(i, 0) - f(X(i, 0), X(i, 1), T, beta);
+    }
+
+    nextBeta = beta + b * r;
+    if ((nextBeta - beta).norm() < 1e-5) {
+      repeat = false;
+    }
+    beta = nextBeta;
+
+    fmt::print(stderr, "Step\n");
+    fmt::print(stderr, "  {}, {}, {}\n", beta(0), beta(1), beta(2));
+  }
+
+  Eigen::MatrixXd r{rows, 1};
+  for (int i = 0; i < rows; ++i) {
+    r(i) = y(i, 0) - f(X(i, 0), X(i, 1), T, beta);
+  }
+
+  // We will now calculate r^2 or the coefficient of determination, which
+  // tells us how much of the total variation (variation in y) can be
+  // explained by the regression model.
+
+  // We will first calculate the sum of the squares of the error, or the
+  // variation in error (SSE).
+  double SSE = r.squaredNorm();
+
+  // Now we will calculate the total variation in y, known as SSTO.
+  double SSTO = ((y.transpose() * y) - (1 / n) * (y.transpose() * y)).value();
+
+  double rSquared = (SSTO - SSE) / SSTO;
+  double adjRSquared = 1 - (1 - rSquared) * ((n - 1.0) / (n - 3));
+
+  std::vector<double> b;
+  for (int i = 0; i < 3; ++i) {
+    b.emplace_back(beta(i));
+  }
+  return {b, adjRSquared};
+}
+
 std::tuple<std::vector<double>, double> sysid::CalculateFeedforwardGains(
     const Storage& data, const AnalysisType& type) {
   units::second_t dtMean = GetMeanTimeDelta(data);
@@ -120,7 +232,6 @@ std::tuple<std::vector<double>, double> sysid::CalculateFeedforwardGains(
       gains.emplace_back(-delta / beta);
     }
 
-    // Gains are Ks, Kv, Ka, Kg (elevator only)
-    return std::tuple{gains, std::get<1>(ols)};
+    return RefineGains(olsData, dtMean, type.independentVariables, gains);
   }
 }
