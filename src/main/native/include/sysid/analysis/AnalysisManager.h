@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -60,10 +61,12 @@ class AnalysisManager {
     double motionThreshold = 0.2;
 
     /** The window size for computing acceleration */
-    int windowSize = 8;
+    int windowSize = 9;
 
     /** The dataset that is being analyzed. */
     int dataset = 0;
+
+    float stepTestDuration = 0.0;  // Indicate that it hasn't been set yet
 
     /** The conversion factors. These contain values to convert feedback gains
      * by gearing and cpr. */
@@ -101,8 +104,7 @@ class AnalysisManager {
    * @param settings The settings for this instance of the analysis manager.
    * @param logger   The logger instance to use for log data.
    */
-  AnalysisManager(wpi::StringRef path, const Settings& settings,
-                  wpi::Logger& logger);
+  AnalysisManager(wpi::StringRef path, Settings& settings, wpi::Logger& logger);
 
   /**
    * Prepares data from the JSON and stores the output in the StringMap.
@@ -153,13 +155,36 @@ class AnalysisManager {
   double GetFactor() const { return m_factor; }
 
   /**
-   * Returns a reference to the iterator of the currently selected datset.
+   * Returns a reference to the iterator of the currently selected raw datset.
    * Unfortunately, due to ImPlot internals, the reference cannot be const so
    * the user should be careful not to change any data.
    *
    * @return A reference to the raw internal data.
    */
-  Storage& GetRawData() { return m_datasets[kDatasets[m_settings.dataset]]; }
+  Storage& GetRawData() { return m_rawDatasets[kDatasets[m_settings.dataset]]; }
+
+  /**
+   * Returns a reference to the iterator of the currently selected filtered
+   * datset. Unfortunately, due to ImPlot internals, the reference cannot be
+   * const so the user should be careful not to change any data.
+   *
+   * @return A reference to the filtered internal data.
+   */
+  Storage& GetFilteredData() {
+    return m_filteredDatasets[kDatasets[m_settings.dataset]];
+  }
+
+  /**
+   * Returns the minimum duration of the Step Voltage Test of the currently
+   * stored data.
+   */
+  double GetMinDuration() const { return m_minDuration; }
+
+  /**
+   * Returns the maximum duration of the Step Voltage Test of the currently
+   * stored data.
+   */
+  double GetMaxDuration() const { return m_maxDuration; }
 
  private:
   wpi::Logger& m_logger;
@@ -167,17 +192,21 @@ class AnalysisManager {
   // This is used to store the various datasets (i.e. Combined, Forward,
   // Backward, etc.)
   wpi::json m_json;
-  wpi::StringMap<Storage> m_datasets;
+  wpi::StringMap<Storage> m_rawDatasets;
+  wpi::StringMap<Storage> m_filteredDatasets;
 
   // The settings for this instance. This contains pointers to the feedback
   // controller preset, LQR parameters, acceleration window size, etc.
-  const Settings& m_settings;
+  Settings& m_settings;
 
   // Miscellaneous data from the JSON -- the analysis type, the units, and the
   // units per rotation.
   AnalysisType m_type;
   std::string m_unit;
   double m_factor;
+
+  double m_minDuration;
+  double m_maxDuration;
 
   // Stores an optional track width if we are doing the drivetrain angular test.
   std::optional<double> m_trackWidth;

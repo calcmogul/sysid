@@ -86,5 +86,9 @@ class Analyzer : public glass::View {
 
   // Plot
   AnalyzerPlot m_plot{m_logger};
+
+  float m_graphScroll = 0.0;
+  bool m_graphLoaded = false;
+  bool m_dataLoaded = false;
 };
 }  // namespace sysid

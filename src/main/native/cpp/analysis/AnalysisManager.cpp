@@ -5,8 +5,12 @@
 #include "sysid/analysis/AnalysisManager.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <initializer_list>
+#include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -18,6 +22,7 @@
 #include <wpi/raw_ostream.h>
 
 #include "sysid/analysis/AnalysisType.h"
+#include "sysid/analysis/FilteringUtils.h"
 #include "sysid/analysis/JSONConverter.h"
 #include "sysid/analysis/TrackWidthAnalysis.h"
 
@@ -37,28 +42,6 @@ static std::vector<PreparedData> Concatenate(
 
   // Return the dest vector.
   return dest;
-}
-
-/**
- * Trims quasistatic data so that no point has a voltage of zero or a velocity
- * less than the motion threshold.
- *
- * @tparam S        The size of the raw data array.
- * @tparam Voltage  The index of the voltage entry in the raw data.
- * @tparam Velocity The index of the velocity entry in the raw data.
- *
- * @param data            A pointer to the vector of raw data.
- * @param motionThreshold The velocity threshold under which to delete data.
- */
-template <size_t S, size_t Voltage, size_t Velocity>
-void TrimQuasistaticData(std::vector<std::array<double, S>>* data,
-                         double motionThreshold) {
-  data->erase(std::remove_if(data->begin(), data->end(),
-                             [motionThreshold](const auto& pt) {
-                               return std::abs(pt[Voltage]) <= 0 ||
-                                      std::abs(pt[Velocity]) < motionThreshold;
-                             }),
-              data->end());
 }
 
 /**
@@ -84,70 +67,22 @@ std::vector<PreparedData> ComputeAcceleration(
         "The data collected is too small! This can be caused by too high of a "
         "motion threshold or bad data collection.");
   }
-  prepared.reserve(data.size() - window);
+  prepared.reserve(data.size());
 
   // Compute acceleration and add it to the vector.
   for (size_t i = step; i < data.size() - step; ++i) {
     const auto& pt = data[i];
-    double acc = (data[i + step][Velocity] - data[i - step][Velocity]) /
-                 (data[i + step][0] - data[i - step][0]);
+    double acc = 0.0;
 
-    // Sometimes, if the encoder velocities are the same, it will register zero
-    // acceleration. Do not include these values.
-    if (acc != 0) {
-      prepared.push_back(PreparedData{pt[0], pt[Voltage], pt[Position],
-                                      pt[Velocity], acc, 0.0});
-    }
+    acc = (data[i + step][Velocity] - data[i - step][Velocity]) /
+          (data[i + step][0] - data[i - step][0]);
+
+    prepared.push_back(
+        PreparedData{pt[0], pt[Voltage], pt[Position], pt[Velocity], acc, 0.0});
   }
+
+  // Return acceleration with median filter applied
   return prepared;
-}
-
-/**
- * Trims the step voltage data to discard all points before the maximum
- * acceleration.
- *
- * @param data A pointer to the step voltage data.
- */
-void TrimStepVoltageData(std::vector<PreparedData>* data) {
-  // We want to find the point where the acceleration data roughly stops
-  // decreasing at the beginning.
-  size_t idx = 0;
-
-  // We will use this to make sure that the acceleration is decreasing for 3
-  // consecutive entries in a row. This will help avoid false positives from
-  // bad data.
-  bool caution = false;
-
-  for (size_t i = 0; i < data->size(); ++i) {
-    // Get the current acceleration.
-    double acc = std::abs(data->at(i).acceleration);
-
-    // If we are not in caution, the acceleration values are still increasing.
-    if (!caution) {
-      if (acc < std::abs(data->at(idx).acceleration)) {
-        // We found a potential candidate. Let's mark the flag and continue
-        // checking...
-        caution = true;
-      } else {
-        // Set the current acceleration to be the highest so far.
-        idx = i;
-      }
-    } else {
-      // Check to make sure the acceleration value is still smaller. If it
-      // isn't, break out of caution.
-      if (acc >= std::abs(data->at(idx).acceleration)) {
-        caution = false;
-        idx = i;
-      }
-    }
-
-    // If we were in caution for three iterations, we can exit.
-    if (caution && (i - idx) == 3) {
-      break;
-    }
-  }
-
-  data->erase(data->begin(), data->begin() + idx);
 }
 
 /**
@@ -169,6 +104,15 @@ static void CalculateCosine(std::vector<PreparedData>* data,
   }
 }
 
+template <size_t S>
+static double GetMaxTime(
+    wpi::StringMap<std::vector<std::array<double, S>>> data, size_t timeCol) {
+  return std::max(
+      data["fast-forward"].back()[timeCol] - data["fast-forward"][0][timeCol],
+      data["fast-backward"].back()[timeCol] -
+          data["fast-backward"][0][timeCol]);
+}
+
 /**
  * Prepares data for general mechanisms (i.e. not drivetrain) and stores them
  * in the analysis manager dataset.
@@ -183,9 +127,11 @@ static void CalculateCosine(std::vector<PreparedData>* data,
  *                 manager instance.
  */
 static void PrepareGeneralData(const wpi::json& json,
-                               const AnalysisManager::Settings& settings,
+                               AnalysisManager::Settings& settings,
                                double factor, wpi::StringRef unit,
-                               wpi::StringMap<Storage>& datasets) {
+                               wpi::StringMap<Storage>& rawDatasets,
+                               wpi::StringMap<Storage>& filteredDatasets,
+                               double& minStepTime, double& maxStepTime) {
   using Data = std::array<double, 4>;
   wpi::StringMap<std::vector<Data>> data;
 
@@ -212,20 +158,38 @@ static void PrepareGeneralData(const wpi::json& json,
 
   // Trim quasistatic test data to remove all points where voltage is zero or
   // velocity < motion threshold.
-  TrimQuasistaticData<4, kVoltageCol, kVelCol>(&data["slow-forward"],
-                                               settings.motionThreshold);
-  TrimQuasistaticData<4, kVoltageCol, kVelCol>(&data["slow-backward"],
-                                               settings.motionThreshold);
+  sysid::TrimQuasistaticData<4, kVoltageCol, kVelCol>(&data["slow-forward"],
+                                                      settings.motionThreshold);
+  sysid::TrimQuasistaticData<4, kVoltageCol, kVelCol>(&data["slow-backward"],
+                                                      settings.motionThreshold);
 
-  // Compute acceleration on all data sets.
-  auto sf = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+  // Compute acceleration on raw data
+  auto rawSf = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
       data["slow-forward"], settings.windowSize);
-  auto sb = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+  auto rawSb = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
       data["slow-backward"], settings.windowSize);
-  auto ff = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+  auto rawFf = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
       data["fast-forward"], settings.windowSize);
-  auto fb = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+  auto rawFb = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
       data["fast-backward"], settings.windowSize);
+
+  // Compute acceleration on median filtered data sets.
+  auto sf = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+      sysid::ApplyMedianFilter<4, kVelCol>(data["slow-forward"],
+                                           settings.windowSize),
+      settings.windowSize);
+  auto sb = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+      sysid::ApplyMedianFilter<4, kVelCol>(data["slow-backward"],
+                                           settings.windowSize),
+      settings.windowSize);
+  auto ff = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+      sysid::ApplyMedianFilter<4, kVelCol>(data["fast-forward"],
+                                           settings.windowSize),
+      settings.windowSize);
+  auto fb = ComputeAcceleration<4, kVoltageCol, kPosCol, kVelCol>(
+      sysid::ApplyMedianFilter<4, kVelCol>(data["fast-backward"],
+                                           settings.windowSize),
+      settings.windowSize);
 
   // Calculate cosine of position data.
   CalculateCosine(&sf, unit);
@@ -233,14 +197,29 @@ static void PrepareGeneralData(const wpi::json& json,
   CalculateCosine(&ff, unit);
   CalculateCosine(&fb, unit);
 
+  // Find the maximum Step Test Duration
+  maxStepTime = GetMaxTime<4>(data, kTimeCol);
+
+  // Trim the raw step voltage data.
+  double tempTime =
+      0.0;  // Raw data shouldn't be used to calculate mininum step test time
+  sysid::TrimStepVoltageData(&rawFf, settings, tempTime);
+  sysid::TrimStepVoltageData(&rawFb, settings, tempTime);
+
   // Trim the step voltage data.
-  TrimStepVoltageData(&ff);
-  TrimStepVoltageData(&fb);
+  sysid::TrimStepVoltageData(&ff, settings, minStepTime);
+  sysid::TrimStepVoltageData(&fb, settings, minStepTime);
+
+  // Store the raw datasets
+  rawDatasets["Forward"] = std::make_tuple(rawSf, rawFf);
+  rawDatasets["Backward"] = std::make_tuple(rawSb, rawFb);
+  rawDatasets["Combined"] = std::make_tuple(Concatenate(rawSf, {&rawSb}),
+                                            Concatenate(rawFf, {&rawFb}));
 
   // Create the distinct datasets and store them in our StringMap.
-  datasets["Forward"] = std::make_tuple(sf, ff);
-  datasets["Backward"] = std::make_tuple(sb, fb);
-  datasets["Combined"] =
+  filteredDatasets["Forward"] = std::make_tuple(sf, ff);
+  filteredDatasets["Backward"] = std::make_tuple(sb, fb);
+  filteredDatasets["Combined"] =
       std::make_tuple(Concatenate(sf, {&sb}), Concatenate(ff, {&fb}));
 }
 
@@ -260,9 +239,10 @@ static void PrepareGeneralData(const wpi::json& json,
  *                 manager instance.
  */
 static void PrepareAngularDrivetrainData(
-    const wpi::json& json, const AnalysisManager::Settings& settings,
-    double factor, std::optional<double>& tw,
-    wpi::StringMap<Storage>& datasets) {
+    const wpi::json& json, AnalysisManager::Settings& settings, double factor,
+    std::optional<double>& tw, wpi::StringMap<Storage>& rawDatasets,
+    wpi::StringMap<Storage>& filteredDatasets, double& minStepTime,
+    double& maxStepTime) {
   using Data = std::array<double, 9>;
   wpi::StringMap<std::vector<Data>> data;
 
@@ -291,9 +271,9 @@ static void PrepareAngularDrivetrainData(
 
   // Trim quasistatic test data to remove all points where voltage is zero or
   // velocity < motion threshold.
-  TrimQuasistaticData<9, kVoltageCol, kAngularRateCol>(
+  sysid::TrimQuasistaticData<9, kVoltageCol, kAngularRateCol>(
       &data["slow-forward"], settings.motionThreshold);
-  TrimQuasistaticData<9, kVoltageCol, kAngularRateCol>(
+  sysid::TrimQuasistaticData<9, kVoltageCol, kAngularRateCol>(
       &data["slow-backward"], settings.motionThreshold);
 
   // Compute acceleration on all data sets.
@@ -306,9 +286,12 @@ static void PrepareAngularDrivetrainData(
   auto fb = ComputeAcceleration<9, kVoltageCol, kAngleCol, kAngularRateCol>(
       data["fast-backward"], settings.windowSize);
 
+  // Get Max Time
+  maxStepTime = GetMaxTime<9>(data, kTimeCol);
+
   // Trim the step voltage data.
-  TrimStepVoltageData(&ff);
-  TrimStepVoltageData(&fb);
+  sysid::TrimStepVoltageData(&ff, settings, minStepTime);
+  sysid::TrimStepVoltageData(&fb, settings, maxStepTime);
 
   // Calculate track width from the slow-forward raw data.
   auto& twd = data["slow-forward"];
@@ -318,9 +301,9 @@ static void PrepareAngularDrivetrainData(
   tw = sysid::CalculateTrackWidth(l, r, units::radian_t(a));
 
   // Create the distinct datasets and store them in our StringMap.
-  datasets["Forward"] = std::make_tuple(sf, ff);
-  datasets["Backward"] = std::make_tuple(sb, fb);
-  datasets["Combined"] =
+  filteredDatasets["Forward"] = std::make_tuple(sf, ff);
+  filteredDatasets["Backward"] = std::make_tuple(sb, fb);
+  filteredDatasets["Combined"] =
       std::make_tuple(Concatenate(sf, {&sb}), Concatenate(ff, {&fb}));
 }
 
@@ -338,8 +321,10 @@ static void PrepareAngularDrivetrainData(
  *                 manager instance.
  */
 static void PrepareLinearDrivetrainData(
-    const wpi::json& json, const AnalysisManager::Settings& settings,
-    double factor, wpi::StringMap<Storage>& datasets) {
+    const wpi::json& json, AnalysisManager::Settings& settings, double factor,
+    wpi::StringMap<Storage>& rawDatasets,
+    wpi::StringMap<Storage>& filteredDatasets, double& minStepTime,
+    double& maxStepTime) {
   using Data = std::array<double, 9>;
   wpi::StringMap<std::vector<Data>> data;
 
@@ -372,38 +357,104 @@ static void PrepareLinearDrivetrainData(
 
   // Trim quasistatic test data to remove all points where voltage is zero or
   // velocity < motion threshold.
-  TrimQuasistaticData<9, kLVoltageCol, kLVelCol>(&data["slow-forward"],
-                                                 settings.motionThreshold);
-  TrimQuasistaticData<9, kLVoltageCol, kLVelCol>(&data["slow-backward"],
-                                                 settings.motionThreshold);
-  TrimQuasistaticData<9, kRVoltageCol, kRVelCol>(&data["slow-forward"],
-                                                 settings.motionThreshold);
-  TrimQuasistaticData<9, kRVoltageCol, kRVelCol>(&data["slow-backward"],
-                                                 settings.motionThreshold);
+  sysid::TrimQuasistaticData<9, kLVoltageCol, kLVelCol>(
+      &data["slow-forward"], settings.motionThreshold);
+  sysid::TrimQuasistaticData<9, kLVoltageCol, kLVelCol>(
+      &data["slow-backward"], settings.motionThreshold);
+  sysid::TrimQuasistaticData<9, kRVoltageCol, kRVelCol>(
+      &data["slow-forward"], settings.motionThreshold);
+  sysid::TrimQuasistaticData<9, kRVoltageCol, kRVelCol>(
+      &data["slow-backward"], settings.motionThreshold);
+
+  // Compute acceleration on all raw data sets.
+  auto rawSfl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
+      data["slow-forward"], settings.windowSize);
+  auto rawSbl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
+      data["slow-backward"], settings.windowSize);
+  auto rawFfl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
+      data["fast-forward"], settings.windowSize);
+  auto rawFbl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
+      data["fast-backward"], settings.windowSize);
+  auto rawSfr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
+      data["slow-forward"], settings.windowSize);
+  auto rawSbr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
+      data["slow-backward"], settings.windowSize);
+  auto rawFfr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
+      data["fast-forward"], settings.windowSize);
+  auto rawFbr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
+      data["fast-backward"], settings.windowSize);
 
   // Compute acceleration on all data sets.
   auto sfl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
-      data["slow-forward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kLVelCol>(data["slow-forward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto sbl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
-      data["slow-backward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kLVelCol>(data["slow-backward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto ffl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
-      data["fast-forward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kLVelCol>(data["fast-forward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto fbl = ComputeAcceleration<9, kLVoltageCol, kLPosCol, kLVelCol>(
-      data["fast-backward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kLVelCol>(data["fast-backward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto sfr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
-      data["slow-forward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kRVelCol>(data["slow-forward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto sbr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
-      data["slow-backward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kRVelCol>(data["slow-backward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto ffr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
-      data["fast-forward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kRVelCol>(data["fast-forward"],
+                                            settings.windowSize),
+      settings.windowSize);
   auto fbr = ComputeAcceleration<9, kRVoltageCol, kRPosCol, kRVelCol>(
-      data["fast-backward"], settings.windowSize);
+      sysid::ApplyMedianFilter<9, kRVelCol>(data["fast-backward"],
+                                            settings.windowSize),
+      settings.windowSize);
+
+  // Get maximum dynamic test duration
+  maxStepTime = GetMaxTime<9>(data, kTimeCol);
+
+  // Trim raw step voltage data
+  double tempTime =
+      0.0;  // Raw data shouldn't be used to calculate mininum step test time
+  sysid::TrimStepVoltageData(&rawFfl, settings, tempTime);
+  sysid::TrimStepVoltageData(&rawFfr, settings, tempTime);
+  sysid::TrimStepVoltageData(&rawFbl, settings, tempTime);
+  sysid::TrimStepVoltageData(&rawFbr, settings, tempTime);
 
   // Trim the step voltage data.
-  TrimStepVoltageData(&ffl);
-  TrimStepVoltageData(&ffr);
-  TrimStepVoltageData(&fbl);
-  TrimStepVoltageData(&fbr);
+  sysid::TrimStepVoltageData(&ffl, settings, minStepTime);
+  sysid::TrimStepVoltageData(&ffr, settings, minStepTime);
+  sysid::TrimStepVoltageData(&fbl, settings, minStepTime);
+  sysid::TrimStepVoltageData(&fbr, settings, minStepTime);
+
+  // Create the distinct raw datasets and store them in our StringMap.
+  auto raw_sf = Concatenate(rawSfl, {&rawSfr});
+  auto raw_sb = Concatenate(rawSbl, {&rawSbr});
+  auto raw_ff = Concatenate(rawFfl, {&rawFfr});
+  auto raw_fb = Concatenate(rawFbl, {&rawFbr});
+
+  rawDatasets["Forward"] = std::make_tuple(raw_sf, raw_ff);
+  rawDatasets["Backward"] = std::make_tuple(raw_sb, raw_fb);
+  rawDatasets["Combined"] = std::make_tuple(Concatenate(raw_sf, {&raw_sb}),
+                                            Concatenate(raw_ff, {&raw_fb}));
+
+  rawDatasets["Left Forward"] = std::make_tuple(rawSfl, rawFfl);
+  rawDatasets["Left Backward"] = std::make_tuple(rawSbl, rawFbl);
+  rawDatasets["Left Combined"] = std::make_tuple(
+      Concatenate(rawSfl, {&rawSbl}), Concatenate(rawFfl, {&rawFbl}));
+
+  rawDatasets["Right Forward"] = std::make_tuple(rawSfr, rawFfr);
+  rawDatasets["Right Backward"] = std::make_tuple(rawSbr, rawFbr);
+  rawDatasets["Right Combined"] = std::make_tuple(
+      Concatenate(rawSfr, {&rawSbr}), Concatenate(rawFfr, {&rawFbr}));
 
   // Create the distinct datasets and store them in our StringMap.
   auto sf = Concatenate(sfl, {&sfr});
@@ -411,23 +462,23 @@ static void PrepareLinearDrivetrainData(
   auto ff = Concatenate(ffl, {&ffr});
   auto fb = Concatenate(fbl, {&fbr});
 
-  datasets["Forward"] = std::make_tuple(sf, ff);
-  datasets["Backward"] = std::make_tuple(sb, fb);
-  datasets["Combined"] =
+  filteredDatasets["Forward"] = std::make_tuple(sf, ff);
+  filteredDatasets["Backward"] = std::make_tuple(sb, fb);
+  filteredDatasets["Combined"] =
       std::make_tuple(Concatenate(sf, {&sb}), Concatenate(ff, {&fb}));
 
-  datasets["Left Forward"] = std::make_tuple(sfl, ffl);
-  datasets["Left Backward"] = std::make_tuple(sbl, fbl);
-  datasets["Left Combined"] =
+  filteredDatasets["Left Forward"] = std::make_tuple(sfl, ffl);
+  filteredDatasets["Left Backward"] = std::make_tuple(sbl, fbl);
+  filteredDatasets["Left Combined"] =
       std::make_tuple(Concatenate(sfl, {&sbl}), Concatenate(ffl, {&fbl}));
 
-  datasets["Right Forward"] = std::make_tuple(sfr, ffr);
-  datasets["Right Backward"] = std::make_tuple(sbr, fbr);
-  datasets["Right Combined"] =
+  filteredDatasets["Right Forward"] = std::make_tuple(sfr, ffr);
+  filteredDatasets["Right Backward"] = std::make_tuple(sbr, fbr);
+  filteredDatasets["Right Combined"] =
       std::make_tuple(Concatenate(sfr, {&sbr}), Concatenate(ffr, {&fbr}));
 }
 
-AnalysisManager::AnalysisManager(wpi::StringRef path, const Settings& settings,
+AnalysisManager::AnalysisManager(wpi::StringRef path, Settings& settings,
                                  wpi::Logger& logger)
     : m_settings(settings), m_logger(logger) {
   // Read JSON from the specified path.
@@ -454,6 +505,10 @@ AnalysisManager::AnalysisManager(wpi::StringRef path, const Settings& settings,
     m_unit = m_json.at("units").get<std::string>();
     m_factor = m_json.at("unitsPerRotation").get<double>();
 
+    // Reset settings for Dynamic Test Limits
+    m_settings.stepTestDuration = 0.0;
+    m_minDuration = std::numeric_limits<float>::max();
+
     // Prepare data.
     PrepareData();
   }
@@ -461,19 +516,23 @@ AnalysisManager::AnalysisManager(wpi::StringRef path, const Settings& settings,
 
 void AnalysisManager::PrepareData() {
   if (m_type == analysis::kDrivetrain) {
-    PrepareLinearDrivetrainData(m_json, m_settings, m_factor, m_datasets);
+    PrepareLinearDrivetrainData(m_json, m_settings, m_factor, m_rawDatasets,
+                                m_filteredDatasets, m_minDuration,
+                                m_maxDuration);
   } else if (m_type == analysis::kDrivetrainAngular) {
     PrepareAngularDrivetrainData(m_json, m_settings, m_factor, m_trackWidth,
-                                 m_datasets);
+                                 m_rawDatasets, m_filteredDatasets,
+                                 m_minDuration, m_maxDuration);
   } else {
-    PrepareGeneralData(m_json, m_settings, m_factor, m_unit, m_datasets);
+    PrepareGeneralData(m_json, m_settings, m_factor, m_unit, m_rawDatasets,
+                       m_filteredDatasets, m_minDuration, m_maxDuration);
   }
 }
 
 AnalysisManager::Gains AnalysisManager::Calculate() {
   // Calculate feedforward gains from the data.
   auto ff = sysid::CalculateFeedforwardGains(
-      m_datasets[kDatasets[m_settings.dataset]], m_type);
+      m_filteredDatasets[kDatasets[m_settings.dataset]], m_type);
 
   // Create the struct that we need for feedback analysis.
   auto& f = std::get<0>(ff);

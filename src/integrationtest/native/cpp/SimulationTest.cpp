@@ -103,6 +103,7 @@ class IntegrationTest : public ::testing::Test {
     auto path = m_manager->SaveJSON(PROJECT_ROOT_DIR);
     try {
       auto analyzerSettings = sysid::AnalysisManager::Settings{};
+      analyzerSettings.windowSize = 15;
       if (m_settings.mechanism == sysid::analysis::kArm) {
         analyzerSettings.motionThreshold = 0.01;  // Reduce threshold for arm
                                                   // test
@@ -114,8 +115,12 @@ class IntegrationTest : public ::testing::Test {
       auto ff = std::get<0>(output.ff);
       auto trackWidth = output.trackWidth;
 
-      EXPECT_NEAR(Kv, ff[1], 0.30);
-      EXPECT_NEAR(Ka, ff[2], 0.15);
+      wpi::outs() << "Kv: " << ff[1] << "\n";
+      wpi::outs() << "Ka: " << ff[2] << "\n";
+      wpi::outs().flush();
+
+      EXPECT_NEAR(Kv, ff[1], 0.025);
+      EXPECT_NEAR(Ka, ff[2], 0.05);
 
       if (m_settings.mechanism == sysid::analysis::kElevator) {
         EXPECT_NEAR(kG, ff[3], 0.2);

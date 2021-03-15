@@ -53,6 +53,7 @@ void Analyzer::Display() {
                                                       m_logger);
         m_type = m_manager->GetAnalysisType();
         Calculate();
+        PrepareData();
       } catch (const std::exception& e) {
         // If we run into an error here, let's just ignore it and make the user
         // explicitly select their file.
@@ -178,6 +179,38 @@ void Analyzer::Display() {
       ImGui::Text("Please Select a JSON File");
     } else {
       float beginY = ImGui::GetCursorPosY();
+
+      ImGui::SetCursorPosX(ImGui::GetFontSize() * 15);
+      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4);
+      int window = m_settings.windowSize;
+      if (ImGui::InputInt("Window Size", &window, 0, 0)) {
+        m_settings.windowSize = std::clamp(window, 2, 15);
+        PrepareData();
+        Calculate();
+      }
+
+      ImGui::SetCursorPosX(ImGui::GetFontSize() * 15);
+      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4);
+      double threshold = m_settings.motionThreshold;
+      if (ImGui::InputDouble("Velocity Threshold", &threshold, 0.0, 0.0,
+                             "%.3f")) {
+        m_settings.motionThreshold = std::max(0.0, threshold);
+        PrepareData();
+        Calculate();
+      }
+
+      ImGui::SetCursorPosX(ImGui::GetFontSize() * 15);
+      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4);
+      if (ImGui::SliderFloat("Test Duration", &m_settings.stepTestDuration,
+                             m_manager->GetMinDuration(),
+                             m_manager->GetMaxDuration(), "%.2f")) {
+        PrepareData();
+        Calculate();
+      }
+
+      // Come back to the starting y pos.
+      ImGui::SetCursorPosY(beginY);
+
       ShowGain("Ks", &m_ff[0]);
       ShowGain("Kv", &m_ff[1]);
       ShowGain("Ka", &m_ff[2]);
@@ -193,69 +226,22 @@ void Analyzer::Display() {
       }
 
       ShowGain("r-squared", &m_rs);
-      float endY = ImGui::GetCursorPosY();
 
-      // Come back to the starting y pos.
-      ImGui::SetCursorPosY(beginY);
+      ImGui::Separator();
 
-      // Create buttons to show diagnostics.
-      auto ShowDiagnostics = [&](const char* text) {
-        ImGui::SetCursorPosX(ImGui::GetFontSize() * 15);
-        if (ImGui::Button(text)) {
-          ImGui::OpenPopup(text);
-          std::thread thr{
-              [&] { m_plot.SetData(m_manager->GetRawData(), m_ff, m_type); }};
-          thr.detach();
+      ImGui::BeginChild("Diagnostic Plots");
+      m_plot.DisplayVoltageDomainPlots();
+      m_plot.DisplayTimeDomainPlots();
+
+      if (m_dataLoaded) {
+        if (m_graphLoaded) {
+          m_graphScroll = ImGui::GetScrollY();
+        } else {
+          ImGui::SetScrollY(m_graphScroll);
         }
-      };
-
-      ShowDiagnostics("Voltage-Domain Diagnostics");
-      ShowDiagnostics("Time-Domain Diagnostics");
-
-      ImGui::SetCursorPosX(ImGui::GetFontSize() * 15);
-      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4);
-      int window = m_settings.windowSize;
-      if (ImGui::InputInt("Window Size", &window, 0, 0)) {
-        m_settings.windowSize = std::clamp(window, 2, 10);
-        PrepareData();
-        Calculate();
       }
-
-      ImGui::SetCursorPosX(ImGui::GetFontSize() * 15);
-      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4);
-      double threshold = m_settings.motionThreshold;
-      if (ImGui::InputDouble("Velocity Threshold", &threshold, 0.0, 0.0,
-                             "%.3f")) {
-        m_settings.motionThreshold = std::max(0.0, threshold);
-        PrepareData();
-        Calculate();
-      }
-
-      auto size = ImGui::GetIO().DisplaySize;
-      ImGui::SetNextWindowSize(ImVec2(size.x / 2.5, size.y * 0.9));
-
-      // Show voltage domain diagnostic plots.
-      if (ImGui::BeginPopupModal("Voltage-Domain Diagnostics")) {
-        m_plot.DisplayVoltageDomainPlots();
-        // Button to close popup.
-        if (ImGui::Button("Close")) {
-          ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-      }
-
-      ImGui::SetNextWindowSize(ImVec2(size.x / 2.5, size.y * 0.9));
-
-      // Show time domain diagnostic plots.
-      if (ImGui::BeginPopupModal("Time-Domain Diagnostics")) {
-        m_plot.DisplayTimeDomainPlots();
-        // Button to close popup.
-        if (ImGui::Button("Close")) {
-          ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-      }
-      ImGui::SetCursorPosY(endY);
+      m_graphLoaded = m_dataLoaded;
+      ImGui::EndChild();
     }
   }
   if (ImGui::CollapsingHeader("Feedback Analysis")) {
@@ -469,6 +455,7 @@ void Analyzer::SelectFile() {
       m_manager =
           std::make_unique<AnalysisManager>(*m_location, m_settings, m_logger);
       m_type = m_manager->GetAnalysisType();
+      PrepareData();
       Calculate();
     } catch (const wpi::json::exception& e) {
       m_exception =
@@ -483,6 +470,14 @@ void Analyzer::SelectFile() {
 void Analyzer::PrepareData() {
   try {
     m_manager->PrepareData();
+    m_dataLoaded = false;
+    // Prepare diagnostic plot data
+    std::thread thr{[&] {
+      m_plot.SetData(m_manager->GetRawData(), m_manager->GetFilteredData(),
+                     m_ff, m_type);
+      m_dataLoaded = true;
+    }};
+    thr.detach();
   } catch (const wpi::json::exception& e) {
     m_exception =
         "The provided JSON was invalid! You may need to rerun the logger.\n" +
